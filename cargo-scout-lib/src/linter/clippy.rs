@@ -1,4 +1,5 @@
-use crate::linter::{Lint, Linter};
+use crate::linter;
+use serde::Deserialize;
 use std::io::{self, Write};
 use std::path::Path;
 use std::path::PathBuf;
@@ -13,8 +14,44 @@ pub struct Clippy {
     preview: bool,
 }
 
-impl Linter for Clippy {
-    fn lints(&self, working_dir: PathBuf) -> Result<Vec<Lint>, crate::error::Error> {
+#[derive(Deserialize, Clone)]
+/// A `Linter`s output is a `Vec<Lint>`
+struct Lint {
+    /// The package id
+    /// Example:
+    /// "cargo-scout-lib".to_string()
+    package_id: String,
+    /// The file the lint was reported on
+    /// Example:
+    /// Some("src/lib.rs".to_string())
+    src_path: Option<String>,
+    /// The message structure
+    message: Option<Message>,
+}
+
+#[derive(Deserialize, Clone)]
+/// This struct contains the message output,
+/// and a `Vec<Span>` with the message location
+struct Message {
+    /// The message string
+    /// Example:
+    /// unused variable `count`
+    rendered: String,
+    /// The file names and lines the lint
+    /// was reported on
+    spans: Vec<Span>,
+}
+
+#[derive(Deserialize, Clone)]
+/// A `Span` has a file name, a start and an end line
+struct Span {
+    file_name: String,
+    line_start: u32,
+    line_end: u32,
+}
+
+impl linter::Linter for Clippy {
+    fn lints(&self, working_dir: PathBuf) -> Result<Vec<linter::Lint>, crate::error::Error> {
         println!(
             "[Clippy] - getting lints for directory {}",
             &working_dir.to_str().unwrap_or("<no directory>")
@@ -75,7 +112,13 @@ impl Clippy {
         if let Some(features) = &self.features {
             params.append(&mut vec!["--features", features]);
         }
-        params.append(&mut vec!["--", "-W", "clippy::pedantic"]);
+        params.append(&mut vec![
+            "--",
+            "-W",
+            "clippy::all",
+            "-W",
+            "clippy::pedantic",
+        ]);
         params
     }
 
@@ -134,19 +177,34 @@ impl Clippy {
     }
 }
 #[must_use]
-fn lints(clippy_output: &str) -> Vec<Lint> {
-    clippy_output
+fn lints(clippy_output: &str) -> Vec<linter::Lint> {
+    let mut lints = Vec::new();
+
+    let clippy_messages: Vec<Message> = clippy_output
         .lines()
         .filter(|l| l.starts_with('{'))
-        .filter_map(|line| serde_json::from_str(line).ok())
-        .filter(|lint: &Lint| {
-            if let Some(m) = &lint.message {
-                !m.spans.is_empty()
+        .filter_map(|line| {
+            if let Ok(lint) = serde_json::from_str::<Lint>(line) {
+                lint.message
             } else {
-                false
+                None
             }
         })
-        .collect::<Vec<Lint>>()
+        .filter(|message: &Message| !message.spans.is_empty())
+        .collect();
+
+    for c in clippy_messages {
+        for s in c.spans {
+            lints.push(linter::Lint {
+                message: c.rendered.clone(),
+                location: linter::Location {
+                    path: s.file_name.clone(),
+                    lines: [s.line_start, s.line_end],
+                },
+            })
+        }
+    }
+    lints
 }
 
 #[cfg(test)]
@@ -182,6 +240,8 @@ mod tests {
             "json",
             "--",
             "-W",
+            "clippy::all",
+            "-W",
             "clippy::pedantic",
         ];
 
@@ -194,6 +254,8 @@ mod tests {
             "json",
             "--verbose",
             "--",
+            "-W",
+            "clippy::all",
             "-W",
             "clippy::pedantic",
         ];
@@ -209,6 +271,8 @@ mod tests {
             "json",
             "--no-default-features",
             "--",
+            "-W",
+            "clippy::all",
             "-W",
             "clippy::pedantic",
         ];
@@ -228,6 +292,8 @@ mod tests {
             "--all-features",
             "--",
             "-W",
+            "clippy::all",
+            "-W",
             "clippy::pedantic",
         ];
         assert_eq!(
@@ -245,6 +311,8 @@ mod tests {
             "--features",
             "foo bar baz",
             "--",
+            "-W",
+            "clippy::all",
             "-W",
             "clippy::pedantic",
         ];
@@ -264,6 +332,8 @@ mod tests {
             "json",
             "--",
             "-W",
+            "clippy::all",
+            "-W",
             "clippy::pedantic",
         ];
         assert_eq!(
@@ -282,6 +352,8 @@ mod tests {
             "--verbose",
             "--",
             "-W",
+            "clippy::all",
+            "-W",
             "clippy::pedantic",
         ];
         assert_eq!(
@@ -299,6 +371,8 @@ mod tests {
             "json",
             "--all-features",
             "--",
+            "-W",
+            "clippy::all",
             "-W",
             "clippy::pedantic",
         ];
@@ -321,6 +395,8 @@ mod tests {
             "--no-default-features",
             "--",
             "-W",
+            "clippy::all",
+            "-W",
             "clippy::pedantic",
         ];
         assert_eq!(
@@ -342,6 +418,8 @@ mod tests {
             "foo bar baz",
             "--",
             "-W",
+            "clippy::all",
+            "-W",
             "clippy::pedantic",
         ];
         assert_eq!(
@@ -351,18 +429,14 @@ mod tests {
     }
     #[test]
     fn test_lints() {
-        use crate::linter::{Message, Span};
-        let expected_lints = vec![Lint {
-            package_id: "cargo-scout".to_string(),
-            src_path: Some("test/foo/bar.rs".to_string()),
-            message: Some(Message {
-                rendered: "this is a test lint".to_string(),
-                spans: vec![Span {
-                    file_name: "test/foo/baz.rs".to_string(),
-                    line_start: 10,
-                    line_end: 12,
-                }],
-            }),
+        use super::*;
+        use crate::linter;
+        let expected_lints = vec![linter::Lint {
+            message: "this is a test lint".to_string(),
+            location: linter::Location {
+                path: "test/foo/baz.rs".to_string(),
+                lines: [10, 12],
+            },
         }];
 
         let clippy_output = r#"{"package_id": "cargo-scout","src_path": "test/foo/bar.rs","message": { "rendered": "this is a test lint","spans": [{"file_name": "test/foo/baz.rs","line_start": 10,"line_end": 12}]}}"#;
